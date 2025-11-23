@@ -1,0 +1,37 @@
+{
+    "discord_token": "YOUR_DISCORD_BOT_TOKEN_HERE",
+    "command_prefix": "!",
+    "category_name": "🎥 RUST+ CONTROL",
+    "rust_server": {
+        "ip": "your.server.ip.here",
+        "port": "28082",
+        "steam_id": "76561198012345678",
+        "player_token": "your_player_token_here"
+    },
+    "cameras": {
+        "drone": {
+            "enabled": true
+        },
+        "static1": {
+            "enabled": true
+        },
+        "static2": {
+            "enabled": true
+        }
+    },
+    "switches": {
+        "lights": 12345,
+        "turrets": 12346,
+        "generator": 12347,
+        "trap_door": 12348
+    },
+    "stream_settings": {
+        "stream_fps": 2,
+        "render_entities": true,
+        "entity_render_distance": 100
+    },
+    "features": {
+        "team_chat_enabled": true,
+        "event_notifications_enabled": true
+    }
+}

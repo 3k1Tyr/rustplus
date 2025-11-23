@@ -1,7 +1,12 @@
 # Configuration files (contain sensitive data)
 config.json
 config.json.backup
+config_enhanced.json
+config_enhanced.json.backup
 .env
+
+# Drone screenshots
+drone_screenshots/
 
 # Python
 __pycache__/
