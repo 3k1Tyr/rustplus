@@ -1,0 +1,7 @@
+# Discord Bot Dependencies
+discord.py>=2.0.0
+rustplus>=4.0.0
+Pillow>=9.0.0
+
+# Optional but recommended
+python-dotenv>=0.19.0
