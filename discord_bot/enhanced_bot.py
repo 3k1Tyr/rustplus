@@ -18,7 +18,9 @@ License: MIT
 import asyncio
 import io
 import json
+import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Dict, Optional, Set, List
@@ -30,12 +32,41 @@ from rustplus import RustSocket
 from rustplus.remote.camera.camera_manager import CameraManager
 from rustplus.remote.camera.camera_constants import MovementControls, CameraMovementOptions
 from rustplus.structs import Vector
-from rustplus.events import (
+from rustplus.annotations import (
     ChatEvent,
     TeamEvent,
     EntityEvent,
     ProtobufEvent
 )
+
+# ========================
+# Logging Setup
+# ========================
+
+def setup_logging(log_level=logging.INFO):
+    """Setup logging configuration"""
+    # Create logs directory if it doesn't exist
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+
+    # Configure logging
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_dir / 'enhanced_bot.log'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
+    # Set discord.py logging to WARNING to reduce noise
+    logging.getLogger('discord').setLevel(logging.WARNING)
+    logging.getLogger('discord.http').setLevel(logging.WARNING)
+
+    return logging.getLogger('rustplus_bot')
+
+# Initialize logger
+logger = setup_logging()
 
 # ========================
 # Configuration Management
@@ -51,8 +82,8 @@ class Config:
     def load_config(self) -> dict:
         """Load configuration from file"""
         if not self.config_path.exists():
-            print(f"❌ Configuration file not found: {self.config_path}")
-            print("Run: python setup_wizard_enhanced.py")
+            logger.error(f"Configuration file not found: {self.config_path}")
+            logger.info("Run: python setup_wizard_enhanced.py")
             raise FileNotFoundError(f"Config file not found: {self.config_path}")
 
         with open(self.config_path, 'r') as f:
@@ -71,6 +102,103 @@ class Config:
         return self.config.get(key, default)
 
 # ========================
+# Permission System
+# ========================
+
+def has_permission(ctx, config: Config) -> tuple[bool, str]:
+    """
+    Check if user has permission to execute control commands
+
+    Returns:
+        tuple: (has_permission, reason)
+    """
+    # Get permission config
+    allowed_roles = config.get('permissions', {}).get('allowed_roles', [])
+    allowed_users = config.get('permissions', {}).get('allowed_users', [])
+
+    # If no permissions configured, default to admin-only
+    if not allowed_roles and not allowed_users:
+        if ctx.author.guild_permissions.administrator:
+            return True, "Administrator"
+        return False, "No permissions configured. Administrators only."
+
+    # Check user ID whitelist
+    if ctx.author.id in allowed_users:
+        return True, "User whitelist"
+
+    # Check role whitelist
+    if ctx.guild and hasattr(ctx.author, 'roles'):
+        user_role_names = [role.name for role in ctx.author.roles]
+        for role_name in allowed_roles:
+            if role_name in user_role_names:
+                return True, f"Role: {role_name}"
+
+    # Check admin as fallback
+    if ctx.author.guild_permissions.administrator:
+        return True, "Administrator"
+
+    return False, "Missing required role or user permission"
+
+def require_permission(config: Config):
+    """
+    Decorator for commands that require permissions
+
+    Usage:
+        @require_permission(config)
+        @commands.command()
+        async def my_command(ctx):
+            pass
+    """
+    def decorator(func):
+        async def wrapper(ctx, *args, **kwargs):
+            has_perm, reason = has_permission(ctx, config)
+            if not has_perm:
+                await ctx.send(f"❌ Permission denied: {reason}")
+                logger.warning(f"Permission denied for {ctx.author} ({ctx.author.id}): {reason}")
+                return
+            logger.info(f"Permission granted for {ctx.author} ({ctx.author.id}): {reason}")
+            return await func(ctx, *args, **kwargs)
+        return wrapper
+    return decorator
+
+# ========================
+# Rate Limiter
+# ========================
+
+class RateLimiter:
+    """Simple rate limiter for Discord API calls"""
+
+    def __init__(self, max_calls: int = 5, period: float = 1.0):
+        """
+        Args:
+            max_calls: Maximum number of calls allowed in the period
+            period: Time period in seconds
+        """
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = []
+
+    async def acquire(self):
+        """Wait if necessary to respect rate limit"""
+        now = time.time()
+
+        # Remove old calls outside the period
+        self.calls = [call_time for call_time in self.calls if call_time > now - self.period]
+
+        # If at limit, wait
+        if len(self.calls) >= self.max_calls:
+            sleep_time = self.calls[0] + self.period - now
+            if sleep_time > 0:
+                logger.debug(f"Rate limit: sleeping for {sleep_time:.2f}s")
+                await asyncio.sleep(sleep_time)
+                # Cleanup again after sleeping
+                now = time.time()
+                self.calls = [call_time for call_time in self.calls if call_time > now - self.period]
+
+        # Record this call
+        self.calls.append(time.time())
+
+# ========================
 # Camera Grid Manager
 # ========================
 
@@ -86,6 +214,8 @@ class CameraGridManager:
         self.update_interval = 1.0 / self.fps
         self.last_update = 0
         self.last_resubscribe = {}
+        # Rate limiter: 4 updates per second max (conservative)
+        self.rate_limiter = RateLimiter(max_calls=4, period=1.0)
 
     async def start(self):
         """Initialize grid message"""
@@ -136,7 +266,7 @@ class CameraGridManager:
                     total_players += len(players)
 
             except Exception as e:
-                print(f"Error getting frame from {cam_id}: {e}")
+                logger.error(f"Error getting frame from {cam_id}: {e}", exc_info=True)
 
         if not frames:
             return
@@ -173,13 +303,57 @@ class CameraGridManager:
         embed.set_image(url="attachment://surveillance_grid.png")
         embed.set_footer(text=f"Updated every {self.update_interval:.1f}s")
 
-        # Update message
+        # Update message with rate limiting
         try:
+            # Respect rate limits
+            await self.rate_limiter.acquire()
+
             file = discord.File(img_bytes, filename='surveillance_grid.png')
             await self.message.edit(embed=embed, attachments=[file])
             self.last_update = current_time
+        except discord.HTTPException as e:
+            if e.status == 429:  # Rate limited despite our protection
+                logger.warning(f"Hit Discord rate limit: {e}")
+                await asyncio.sleep(2)  # Back off
+            else:
+                logger.error(f"Discord HTTP error updating grid: {e}")
         except Exception as e:
-            print(f"Error updating grid: {e}")
+            logger.error(f"Error updating camera grid: {e}", exc_info=True)
+
+    def _get_font(self, size: int = 20) -> ImageFont.FreeTypeFont:
+        """Get font with cross-platform support"""
+        import platform
+
+        font_paths = {
+            'Linux': [
+                '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+                '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',
+                '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+            ],
+            'Darwin': [  # macOS
+                '/System/Library/Fonts/Supplemental/Arial Bold.ttf',
+                '/System/Library/Fonts/Helvetica.ttc',
+                '/Library/Fonts/Arial.ttf',
+            ],
+            'Windows': [
+                'C:\\Windows\\Fonts\\arialbd.ttf',
+                'C:\\Windows\\Fonts\\arial.ttf',
+                'C:\\Windows\\Fonts\\calibrib.ttf',
+            ]
+        }
+
+        system = platform.system()
+        paths = font_paths.get(system, [])
+
+        for path in paths:
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+
+        # Fallback to default font
+        logger.warning(f"Could not load TrueType font on {system}, using default font")
+        return ImageFont.load_default()
 
     def _create_grid_image(self, frames: Dict[str, Image.Image]) -> Image.Image:
         """Create a grid of camera images"""
@@ -216,10 +390,7 @@ class CameraGridManager:
             grid.paste(resized, (x, y))
 
             # Draw label
-            try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-            except:
-                font = ImageFont.load_default()
+            font = self._get_font(20)
 
             # Draw background for text
             text_bg = Image.new('RGBA', (frame_width, 30), color=(0, 0, 0, 180))
@@ -243,6 +414,7 @@ class SmartSwitchManager:
         self.switches = switches  # {name: entity_id}
         self.message: Optional[discord.Message] = None
         self.states = {}
+        self.rate_limiter = RateLimiter(max_calls=4, period=1.0)
 
     async def start(self):
         """Initialize switch control panel"""
@@ -258,7 +430,7 @@ class SmartSwitchManager:
             try:
                 await self.rust_socket.set_subscription_to_entity(entity_id, True)
             except Exception as e:
-                print(f"Error subscribing to {name}: {e}")
+                logger.error(f"Error subscribing to switch {name}: {e}", exc_info=True)
 
         await self.update_display()
 
@@ -274,7 +446,7 @@ class SmartSwitchManager:
                 if hasattr(info, 'value'):
                     self.states[name] = info.value
             except Exception as e:
-                print(f"Error getting {name} state: {e}")
+                logger.warning(f"Error getting {name} state: {e}")
                 self.states[name] = None
 
         # Create embed
@@ -304,10 +476,18 @@ class SmartSwitchManager:
 
         embed.set_footer(text="Use !switch <name> <on/off> to control")
 
+        # Update message with rate limiting
         try:
+            await self.rate_limiter.acquire()  # Respect rate limits
             await self.message.edit(embed=embed)
+        except discord.HTTPException as e:
+            if e.status == 429:  # Rate limited despite our protection
+                logger.warning(f"Hit Discord rate limit on switch display: {e}")
+                await asyncio.sleep(2)  # Back off
+            else:
+                logger.error(f"Discord HTTP error updating switch display: {e}")
         except Exception as e:
-            print(f"Error updating switch display: {e}")
+            logger.error(f"Error updating switch display: {e}", exc_info=True)
 
     async def toggle_switch(self, name: str, value: bool) -> bool:
         """Toggle a switch"""
@@ -322,7 +502,7 @@ class SmartSwitchManager:
             await self.update_display()
             return True
         except Exception as e:
-            print(f"Error toggling {name}: {e}")
+            logger.error(f"Error toggling {name}: {e}", exc_info=True)
             return False
 
 # ========================
@@ -336,6 +516,7 @@ class TeamChatBridge:
         self.rust_socket = rust_socket
         self.channel = channel
         self.bot_user_id = bot_user_id
+        self.rate_limiter = RateLimiter(max_calls=4, period=1.0)
 
     async def send_to_rust(self, message: str, author: str):
         """Send Discord message to Rust team chat"""
@@ -343,7 +524,7 @@ class TeamChatBridge:
         try:
             await self.rust_socket.send_team_message(formatted)
         except Exception as e:
-            print(f"Error sending to Rust chat: {e}")
+            logger.error(f"Error sending to Rust chat: {e}", exc_info=True)
 
     async def send_to_discord(self, message: str, author: str):
         """Send Rust message to Discord"""
@@ -355,20 +536,45 @@ class TeamChatBridge:
         embed.timestamp = discord.utils.utcnow()
 
         try:
+            await self.rate_limiter.acquire()  # Respect rate limits
             await self.channel.send(embed=embed)
+        except discord.HTTPException as e:
+            if e.status == 429:  # Rate limited
+                logger.warning(f"Hit Discord rate limit on team chat: {e}")
+                await asyncio.sleep(2)  # Back off
+            else:
+                logger.error(f"Discord HTTP error sending team chat: {e}")
         except Exception as e:
-            print(f"Error sending to Discord: {e}")
+            logger.error(f"Error sending to Discord: {e}", exc_info=True)
 
 # ========================
 # Event Notifier
 # ========================
 
 class EventNotifier:
-    """Sends notifications for game events"""
+    """
+    Sends notifications for game events
+
+    ⚠️ WARNING: This is a PLANNED FEATURE - NOT FULLY IMPLEMENTED
+
+    The notification methods exist but are NOT automatically triggered because:
+    1. Explosion detection requires parsing protobuf binary data or map markers
+    2. Death detection requires monitoring team member status changes
+    3. Entity destruction requires comparing entity states over time
+
+    To implement these features, you would need to:
+    - Parse AppBroadcast.entity_changed for entity destruction events
+    - Monitor team_info for member deaths (offline status changes)
+    - Parse AppBroadcast for explosion markers (requires protobuf knowledge)
+    - Add polling loops to check for state changes
+
+    Currently these methods can be called manually, but NO automatic detection is implemented.
+    """
 
     def __init__(self, rust_socket: RustSocket, channel: discord.TextChannel):
         self.rust_socket = rust_socket
         self.channel = channel
+        self.rate_limiter = RateLimiter(max_calls=4, period=1.0)
 
     async def notify_explosion(self, location: str = "Unknown"):
         """Notify about explosion"""
@@ -380,9 +586,15 @@ class EventNotifier:
         embed.timestamp = discord.utils.utcnow()
 
         try:
+            await self.rate_limiter.acquire()  # Respect rate limits
             await self.channel.send("@everyone", embed=embed)
-        except:
-            pass
+        except discord.HTTPException as e:
+            if e.status == 429:  # Rate limited
+                logger.warning(f"Hit Discord rate limit on explosion notification: {e}")
+            else:
+                logger.error(f"Discord HTTP error sending explosion notification: {e}")
+        except Exception as e:
+            logger.error(f"Error sending explosion notification: {e}", exc_info=True)
 
     async def notify_player_death(self, player: str):
         """Notify about player death"""
@@ -394,9 +606,15 @@ class EventNotifier:
         embed.timestamp = discord.utils.utcnow()
 
         try:
+            await self.rate_limiter.acquire()  # Respect rate limits
             await self.channel.send(embed=embed)
-        except:
-            pass
+        except discord.HTTPException as e:
+            if e.status == 429:  # Rate limited
+                logger.warning(f"Hit Discord rate limit on death notification: {e}")
+            else:
+                logger.error(f"Discord HTTP error sending death notification: {e}")
+        except Exception as e:
+            logger.error(f"Error sending death notification: {e}", exc_info=True)
 
     async def notify_entity_destroyed(self, entity_type: str):
         """Notify about entity destruction"""
@@ -408,9 +626,15 @@ class EventNotifier:
         embed.timestamp = discord.utils.utcnow()
 
         try:
+            await self.rate_limiter.acquire()  # Respect rate limits
             await self.channel.send(embed=embed)
-        except:
-            pass
+        except discord.HTTPException as e:
+            if e.status == 429:  # Rate limited
+                logger.warning(f"Hit Discord rate limit on entity destroyed notification: {e}")
+            else:
+                logger.error(f"Discord HTTP error sending entity destroyed notification: {e}")
+        except Exception as e:
+            logger.error(f"Error sending entity destroyed notification: {e}", exc_info=True)
 
 # ========================
 # Main Discord Bot
@@ -448,14 +672,14 @@ class EnhancedRustBot(commands.Bot):
     async def setup_hook(self):
         """Called when bot starts"""
         self.update_loop.start()
-        print("✅ Bot setup hook completed")
+        logger.info("✅ Bot setup hook completed")
 
     async def on_ready(self):
         """Called when bot is connected to Discord"""
-        print("=" * 60)
-        print(f"✅ Bot logged in as {self.user}")
-        print(f"📊 Connected to {len(self.guilds)} server(s)")
-        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info(f"✅ Bot logged in as {self.user}")
+        logger.info(f"📊 Connected to {len(self.guilds)} server(s)")
+        logger.info("=" * 60)
 
         # Connect to Rust+
         await self.connect_to_rust()
@@ -467,7 +691,7 @@ class EnhancedRustBot(commands.Bot):
 
     async def connect_to_rust(self):
         """Connect to Rust+ server"""
-        print("\n🔌 Connecting to Rust+ server...")
+        logger.info("🔌 Connecting to Rust+ server...")
 
         rust_config = self.config.get('rust_server')
 
@@ -479,13 +703,14 @@ class EnhancedRustBot(commands.Bot):
                 rust_config['player_token']
             )
             await self.rust_socket.connect()
-            print(f"✅ Connected to Rust+ server")
+            logger.info(f"✅ Connected to Rust+ server: {rust_config['ip']}:{rust_config['port']}")
 
             # Setup event handlers
             await self.setup_event_handlers()
 
         except Exception as e:
-            print(f"❌ Failed to connect: {e}")
+            logger.error(f"❌ Failed to connect to Rust+ server: {e}", exc_info=True)
+            logger.warning("⚠️ Bot will continue but camera features won't work")
 
     async def setup_event_handlers(self):
         """Setup Rust+ event handlers"""
@@ -504,24 +729,24 @@ class EnhancedRustBot(commands.Bot):
             if self.switch_manager:
                 await self.switch_manager.update_display()
 
-        print("✅ Event handlers registered")
+        logger.info("✅ Event handlers registered")
 
     async def setup_channels(self):
         """Setup Discord channels"""
         if not self.guilds:
-            print("❌ Bot is not in any Discord servers!")
+            logger.error("❌ Bot is not in any Discord servers!")
             return
 
         guild = self.guilds[0]
         category_name = self.config.get('category_name', '🎥 RUST+ CONTROL')
 
-        print(f"\n🏗️ Setting up channels in '{guild.name}'...")
+        logger.info(f"\n🏗️ Setting up channels in '{guild.name}'...")
 
         # Find or create category
         category = discord.utils.get(guild.categories, name=category_name)
         if not category:
             category = await guild.create_category(category_name)
-            print(f"✅ Created category: {category_name}")
+            logger.info(f"✅ Created category: {category_name}")
 
         # Create channels
         channels_to_create = {
@@ -538,14 +763,14 @@ class EnhancedRustBot(commands.Bot):
                     channel_name,
                     category=category
                 )
-                print(f"✅ Created channel: #{channel_name}")
+                logger.info(f"✅ Created channel: #{channel_name}")
             setattr(self, attr_name, channel)
 
-        print("✅ All channels ready")
+        logger.info("✅ All channels ready")
 
     async def start_systems(self):
         """Start all bot systems"""
-        print("\n🚀 Starting bot systems...")
+        logger.info("\n🚀 Starting bot systems...")
 
         # Start cameras
         cameras = self.config.get('cameras', {})
@@ -554,9 +779,9 @@ class EnhancedRustBot(commands.Bot):
                 try:
                     camera_mgr = await self.rust_socket.get_camera_manager(cam_id)
                     self.camera_managers[cam_id] = camera_mgr
-                    print(f"✅ Connected to camera: {cam_id}")
+                    logger.info(f"✅ Connected to camera: {cam_id}")
                 except Exception as e:
-                    print(f"❌ Failed to connect to {cam_id}: {e}")
+                    logger.error(f"❌ Failed to connect to {cam_id}: {e}")
 
             if self.camera_managers:
                 self.camera_grid = CameraGridManager(
@@ -565,7 +790,7 @@ class EnhancedRustBot(commands.Bot):
                     self.config.get('stream_settings', {})
                 )
                 await self.camera_grid.start()
-                print(f"✅ Camera grid started with {len(self.camera_managers)} cameras")
+                logger.info(f"✅ Camera grid started with {len(self.camera_managers)} cameras")
 
         # Start switches
         switches = self.config.get('switches', {})
@@ -576,7 +801,7 @@ class EnhancedRustBot(commands.Bot):
                 switches
             )
             await self.switch_manager.start()
-            print(f"✅ Switch manager started with {len(switches)} switches")
+            logger.info(f"✅ Switch manager started with {len(switches)} switches")
 
         # Start team chat bridge
         if self.teamchat_channel:
@@ -585,7 +810,7 @@ class EnhancedRustBot(commands.Bot):
                 self.teamchat_channel,
                 self.user.id
             )
-            print("✅ Team chat bridge started")
+            logger.info("✅ Team chat bridge started")
 
         # Start event notifier
         if self.events_channel:
@@ -593,9 +818,10 @@ class EnhancedRustBot(commands.Bot):
                 self.rust_socket,
                 self.events_channel
             )
-            print("✅ Event notifier started")
+            logger.warning("⚠️ Event notifier initialized but automatic event detection is NOT implemented")
+            logger.info("Event notification methods can be called manually but won't trigger automatically")
 
-        print("\n✅ All systems operational!")
+        logger.info("\n✅ All systems operational!")
 
     @tasks.loop(seconds=0.1)
     async def update_loop(self):
@@ -621,18 +847,18 @@ class EnhancedRustBot(commands.Bot):
 
     async def on_close(self):
         """Cleanup on shutdown"""
-        print("\n🛑 Shutting down...")
+        logger.info("\n🛑 Shutting down...")
 
         for camera_mgr in self.camera_managers.values():
             try:
                 await camera_mgr.exit_camera()
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Error closing camera: {e}")
 
         if self.rust_socket:
             await self.rust_socket.disconnect()
 
-        print("✅ Cleanup complete")
+        logger.info("✅ Cleanup complete")
 
 # ========================
 # Bot Commands
@@ -669,6 +895,13 @@ async def switch_command(ctx, name: str, state: str):
     """
     bot = ctx.bot
 
+    # Permission check
+    has_perm, reason = has_permission(ctx, bot.config)
+    if not has_perm:
+        await ctx.send(f"❌ Permission denied: {reason}")
+        logger.warning(f"Permission denied for {ctx.author} ({ctx.author.id}) on switch command: {reason}")
+        return
+
     if not bot.switch_manager:
         await ctx.send("❌ Switch manager not initialized")
         return
@@ -682,6 +915,7 @@ async def switch_command(ctx, name: str, state: str):
 
     if await bot.switch_manager.toggle_switch(name, value):
         await ctx.send(f"✅ Turned {name} {state}")
+        logger.info(f"{ctx.author} switched {name} to {state}")
     else:
         await ctx.send(f"❌ Failed to control {name}")
 
@@ -692,6 +926,13 @@ async def control_camera(ctx, camera_id: str, action: str):
     Usage: !control <camera_id> <action>
     """
     bot = ctx.bot
+
+    # Permission check
+    has_perm, reason = has_permission(ctx, bot.config)
+    if not has_perm:
+        await ctx.send(f"❌ Permission denied: {reason}")
+        logger.warning(f"Permission denied for {ctx.author} ({ctx.author.id}) on camera control: {reason}")
+        return
 
     if camera_id not in bot.camera_managers:
         await ctx.send(f"❌ Camera {camera_id} not found")
@@ -720,22 +961,27 @@ async def control_camera(ctx, camera_id: str, action: str):
             await asyncio.sleep(0.3)
             await camera_mgr.clear_movement()
             await ctx.send(f"✅ Moved {camera_id} {action}")
+            logger.info(f"{ctx.author} moved camera {camera_id} {action}")
 
         elif action in look_map:
             await camera_mgr.send_mouse_movement(look_map[action])
             await ctx.send(f"✅ Looking {action}")
+            logger.info(f"{ctx.author} looked {action} on camera {camera_id}")
 
         elif action == 'fire':
             await camera_mgr.send_actions([MovementControls.FIRE_PRIMARY])
             await asyncio.sleep(0.1)
             await camera_mgr.clear_movement()
             await ctx.send(f"💥 Fired from {camera_id}!")
+            logger.info(f"{ctx.author} fired from camera {camera_id}")
 
         else:
             await ctx.send(f"❌ Unknown action: {action}")
+            logger.warning(f"{ctx.author} attempted unknown camera action: {action}")
 
     except Exception as e:
         await ctx.send(f"❌ Error: {e}")
+        logger.error(f"Error in camera control for {ctx.author}: {e}", exc_info=True)
 
 def setup_commands(bot: EnhancedRustBot):
     """Add commands to bot"""
@@ -749,6 +995,10 @@ def setup_commands(bot: EnhancedRustBot):
 
 def main():
     """Main entry point"""
+    import signal
+    import sys
+    import traceback
+
     print("=" * 60)
     print("Enhanced Rust+ Discord Bot")
     print("=" * 60)
@@ -766,14 +1016,35 @@ def main():
     bot = EnhancedRustBot(config)
     setup_commands(bot)
 
-    # Run bot
+    # Setup signal handlers for graceful shutdown
+    def signal_handler(signum, frame):
+        """Handle shutdown signals"""
+        print("\n\n🛑 Received shutdown signal...")
+        # Schedule bot close
+        asyncio.run(bot.close())
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Run bot with error recovery
     try:
         print("\n🚀 Starting bot...\n")
         bot.run(config.get('discord_token'))
     except KeyboardInterrupt:
         print("\n\n⏹️ Bot stopped by user")
+    except discord.LoginFailure:
+        print("\n❌ Invalid Discord token!")
+        print("Please check your config_enhanced.json file")
+    except discord.PrivilegedIntentsRequired:
+        print("\n❌ Missing required intents!")
+        print("Enable 'Message Content Intent' in Discord Developer Portal")
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
+        print("\nFull error details:")
+        traceback.print_exc()
+    finally:
+        print("\n👋 Bot shutdown complete")
 
 if __name__ == '__main__':
     main()

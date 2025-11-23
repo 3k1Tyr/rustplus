@@ -32,6 +32,10 @@
     },
     "features": {
         "team_chat_enabled": true,
-        "event_notifications_enabled": true
+        "event_notifications_enabled": false
+    },
+    "permissions": {
+        "allowed_roles": ["Admin", "Moderator", "Base Manager"],
+        "allowed_users": []
     }
 }
