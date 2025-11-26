@@ -39,6 +39,12 @@ from rustplus.annotations import (
     ProtobufEvent
 )
 
+# Import detection system
+from camera_detection import (
+    CameraDetectionManager,
+    DetectionDatabase
+)
+
 # ========================
 # Logging Setup
 # ========================
@@ -663,6 +669,10 @@ class EnhancedRustBot(commands.Bot):
         self.event_notifier: Optional[EventNotifier] = None
         self.camera_managers: Dict[str, CameraManager] = {}
 
+        # Detection system
+        self.detection_db: Optional[DetectionDatabase] = None
+        self.detection_manager: Optional[CameraDetectionManager] = None
+
         # Channels
         self.surveillance_channel: Optional[discord.TextChannel] = None
         self.switches_channel: Optional[discord.TextChannel] = None
@@ -821,13 +831,44 @@ class EnhancedRustBot(commands.Bot):
             logger.warning("⚠️ Event notifier initialized but automatic event detection is NOT implemented")
             logger.info("Event notification methods can be called manually but won't trigger automatically")
 
+        # Start detection system
+        if self.config.get('detection_system', {}).get('enabled', False):
+            try:
+                self.detection_db = DetectionDatabase("discord_bot/camera_detections.db")
+                self.detection_manager = CameraDetectionManager(
+                    self.rust_socket,
+                    self.switch_manager,
+                    self.detection_db
+                )
+                await self.detection_manager.start()
+                logger.info("✅ Camera detection system started")
+            except Exception as e:
+                logger.error(f"Failed to start detection system: {e}", exc_info=True)
+
         logger.info("\n✅ All systems operational!")
+
+    async def _process_camera_detections(self):
+        """Process camera entities for detection system"""
+        try:
+            for cam_id, camera_mgr in self.camera_managers.items():
+                if camera_mgr.has_frame_data():
+                    entities = await camera_mgr.get_entities_in_frame()
+                    if entities:
+                        await self.detection_manager.process_camera_frame(
+                            cam_id, entities, camera_position=None
+                        )
+        except Exception as e:
+            logger.error(f"Error processing camera detections: {e}", exc_info=True)
 
     @tasks.loop(seconds=0.1)
     async def update_loop(self):
         """Main update loop"""
         if self.camera_grid:
             await self.camera_grid.update()
+
+        # Process camera detections
+        if self.detection_manager:
+            await self._process_camera_detections()
 
     async def on_message(self, message):
         """Handle Discord messages"""
@@ -848,6 +889,22 @@ class EnhancedRustBot(commands.Bot):
     async def on_close(self):
         """Cleanup on shutdown"""
         logger.info("\n🛑 Shutting down...")
+
+        # Stop detection manager
+        if self.detection_manager:
+            try:
+                await self.detection_manager.stop()
+                logger.info("Detection manager stopped")
+            except Exception as e:
+                logger.warning(f"Error stopping detection manager: {e}")
+
+        # Close detection database
+        if self.detection_db:
+            try:
+                self.detection_db.close()
+                logger.info("Detection database closed")
+            except Exception as e:
+                logger.warning(f"Error closing detection database: {e}")
 
         for camera_mgr in self.camera_managers.values():
             try:
@@ -983,11 +1040,277 @@ async def control_camera(ctx, camera_id: str, action: str):
         await ctx.send(f"❌ Error: {e}")
         logger.error(f"Error in camera control for {ctx.author}: {e}", exc_info=True)
 
+# ========================
+# Detection Commands
+# ========================
+
+@commands.command(name='detections')
+async def detections_command(ctx, camera_id: str = None):
+    """Show current camera detections with distances
+
+    Usage:
+        !detections          - Show all camera detections
+        !detections drone    - Show specific camera detections
+    """
+    bot = ctx.bot
+
+    if not bot.detection_manager:
+        await ctx.send("❌ Detection system is not enabled")
+        return
+
+    detections = bot.detection_manager.get_current_detections(camera_id)
+
+    if not detections or not any(detections.values()):
+        await ctx.send("🟢 No detections on cameras")
+        return
+
+    embed = discord.Embed(
+        title="🎯 Camera Detections",
+        description="Current entities detected on cameras",
+        color=discord.Color.red()
+    )
+
+    for cam_id, entities in detections.items():
+        if not entities:
+            continue
+
+        # Separate team and enemies
+        enemies = [e for e in entities if not e.is_team_member]
+        team = [e for e in entities if e.is_team_member]
+
+        lines = []
+
+        if enemies:
+            lines.append("**⚠️ ENEMIES:**")
+            for idx, entity in enumerate(sorted(enemies, key=lambda e: e.distance), start=1):
+                lines.append(f"{idx}. {entity.name or 'Unknown'} - **{entity.distance:.1f}m**")
+
+        if team:
+            lines.append("\n**✅ Team:**")
+            for entity in team:
+                lines.append(f"• {entity.name} - {entity.distance:.1f}m")
+
+        if not lines:
+            lines.append("🟢 Clear")
+
+        embed.add_field(
+            name=f"📷 {cam_id.upper()}",
+            value="\n".join(lines),
+            inline=False
+        )
+
+    # Add detection counts
+    if bot.detection_manager.session_detection_counts:
+        counts = []
+        for cam, count in bot.detection_manager.session_detection_counts.items():
+            counts.append(f"{cam}: {count} enemies")
+        embed.set_footer(text="Session counts: " + ", ".join(counts))
+
+    await ctx.send(embed=embed)
+
+@commands.command(name='trigger')
+async def trigger_command(ctx, action: str = None, *args):
+    """Manage distance-based triggers
+
+    Usage:
+        !trigger add <camera> <count> <distance> <switch>
+        !trigger list [camera]
+        !trigger remove <id>
+        !trigger reset [camera]
+
+    Examples:
+        !trigger add drone 1 30 turrets
+        !trigger add drone 2 50 lights
+        !trigger list
+        !trigger list drone
+        !trigger remove 1
+        !trigger reset drone
+    """
+    bot = ctx.bot
+
+    # Permission check
+    has_perm, reason = has_permission(ctx, bot.config)
+    if not has_perm:
+        await ctx.send(f"❌ Permission denied: {reason}")
+        return
+
+    if not bot.detection_manager:
+        await ctx.send("❌ Detection system is not enabled")
+        return
+
+    if not action:
+        await ctx.send("❌ Usage: `!trigger <add|list|remove|reset>`\nSee `!help trigger` for details")
+        return
+
+    action = action.lower()
+
+    # ADD TRIGGER
+    if action == 'add':
+        if len(args) < 4:
+            await ctx.send("❌ Usage: `!trigger add <camera> <count> <distance> <switch>`")
+            return
+
+        camera_id = args[0]
+        try:
+            detection_count = int(args[1])
+            distance_threshold = float(args[2])
+            switch_name = args[3]
+        except ValueError:
+            await ctx.send("❌ Invalid count or distance value")
+            return
+
+        if camera_id not in bot.camera_managers:
+            await ctx.send(f"❌ Camera '{camera_id}' not found")
+            return
+
+        success = await bot.detection_manager.add_trigger(
+            camera_id, detection_count, distance_threshold, switch_name
+        )
+
+        if success:
+            await ctx.send(
+                f"✅ Trigger added:\n"
+                f"Camera: **{camera_id}**\n"
+                f"Detection #{detection_count} at ≤{distance_threshold}m → {switch_name}"
+            )
+            logger.info(f"{ctx.author} added trigger: {camera_id} #{detection_count} @ {distance_threshold}m → {switch_name}")
+        else:
+            await ctx.send(f"❌ Failed to add trigger (check switch name)")
+
+    # LIST TRIGGERS
+    elif action == 'list':
+        camera_id = args[0] if args else None
+
+        triggers = bot.detection_db.get_triggers(camera_id)
+
+        if not triggers:
+            msg = f"No triggers configured"
+            if camera_id:
+                msg += f" for camera '{camera_id}'"
+            await ctx.send(msg)
+            return
+
+        embed = discord.Embed(
+            title="🎯 Distance Triggers",
+            color=discord.Color.blue()
+        )
+
+        for trigger in triggers:
+            status = "✅ Enabled" if trigger.enabled else "❌ Disabled"
+            embed.add_field(
+                name=f"ID {trigger.trigger_id} - {trigger.camera_id.upper()}",
+                value=(
+                    f"Detection #{trigger.detection_count}\n"
+                    f"Distance: ≤{trigger.distance_threshold}m\n"
+                    f"Switch: {trigger.switch_name}\n"
+                    f"Status: {status}"
+                ),
+                inline=True
+            )
+
+        await ctx.send(embed=embed)
+
+    # REMOVE TRIGGER
+    elif action == 'remove':
+        if not args:
+            await ctx.send("❌ Usage: `!trigger remove <id>`")
+            return
+
+        try:
+            trigger_id = int(args[0])
+        except ValueError:
+            await ctx.send("❌ Invalid trigger ID")
+            return
+
+        bot.detection_db.disable_trigger(trigger_id)
+
+        # Remove from runtime cache
+        for cam_id in bot.detection_manager.triggers:
+            bot.detection_manager.triggers[cam_id] = [
+                t for t in bot.detection_manager.triggers[cam_id]
+                if t.trigger_id != trigger_id
+            ]
+
+        await ctx.send(f"✅ Trigger {trigger_id} disabled")
+        logger.info(f"{ctx.author} disabled trigger {trigger_id}")
+
+    # RESET DETECTION COUNTS
+    elif action == 'reset':
+        camera_id = args[0] if args else None
+        bot.detection_manager.reset_detection_counts(camera_id)
+
+        if camera_id:
+            await ctx.send(f"✅ Reset detection count for {camera_id}")
+        else:
+            await ctx.send("✅ Reset all detection counts")
+        logger.info(f"{ctx.author} reset detection counts")
+
+    else:
+        await ctx.send(f"❌ Unknown action '{action}'\nUse: add, list, remove, reset")
+
+@commands.command(name='history')
+async def history_command(ctx, camera_id: str = None, limit: int = 10):
+    """View detection history from database
+
+    Usage:
+        !history               - Last 10 detections (all cameras)
+        !history drone         - Last 10 detections (drone camera)
+        !history drone 20      - Last 20 detections (drone camera)
+    """
+    bot = ctx.bot
+
+    if not bot.detection_db:
+        await ctx.send("❌ Detection system is not enabled")
+        return
+
+    limit = min(limit, 50)  # Cap at 50
+
+    detections = bot.detection_db.get_recent_detections(camera_id, limit, enemies_only=True)
+
+    if not detections:
+        await ctx.send("📊 No detection history found")
+        return
+
+    embed = discord.Embed(
+        title="📊 Detection History",
+        description=f"Last {len(detections)} enemy detections",
+        color=discord.Color.orange()
+    )
+
+    lines = []
+    for detection in detections[:20]:  # Show max 20 in embed
+        time_str = detection['timestamp'].strftime("%H:%M:%S")
+        triggered = f" → {detection['triggered_switch']}" if detection['triggered_switch'] else ""
+        lines.append(
+            f"`{time_str}` **{detection['camera_id']}** - "
+            f"{detection['player_name']} @ {detection['distance']:.1f}m{triggered}"
+        )
+
+    embed.description += "\n\n" + "\n".join(lines)
+
+    # Add stats
+    stats = bot.detection_db.get_stats(camera_id)
+    embed.add_field(
+        name="📈 Statistics",
+        value=(
+            f"Total: {stats['total_detections']}\n"
+            f"Enemies: {stats['enemy_detections']}\n"
+            f"Avg Distance: {stats['avg_distance']}m\n"
+            f"Range: {stats['min_distance']}-{stats['max_distance']}m"
+        ),
+        inline=False
+    )
+
+    await ctx.send(embed=embed)
+
 def setup_commands(bot: EnhancedRustBot):
     """Add commands to bot"""
     bot.add_command(status_command)
     bot.add_command(switch_command)
     bot.add_command(control_camera)
+    bot.add_command(detections_command)
+    bot.add_command(trigger_command)
+    bot.add_command(history_command)
 
 # ========================
 # Main Entry Point

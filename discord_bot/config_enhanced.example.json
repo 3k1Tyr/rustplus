@@ -37,5 +37,9 @@
     "permissions": {
         "allowed_roles": ["Admin", "Moderator", "Base Manager"],
         "allowed_users": []
+    },
+    "detection_system": {
+        "enabled": false,
+        "update_interval": 2.0
     }
 }
